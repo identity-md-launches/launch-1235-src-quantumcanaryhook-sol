@@ -35,7 +35,15 @@ The existing mainnet fork rehearsal skips without fork state. These offline test
 do not establish the live observer's bytecode or the external factory's supply
 distribution.
 
-An extreme signed-input arithmetic failure is reported separately in
-`.imd-findings.json`, with a self-contained Foundry reproduction. Its source was
-run under `test/scratch/` and failed on the current implementation. It is excluded
-from the delivered passing suite; no test asserts that failure is correct.
+The prior signed-input overflow finding
+`74aefb96591090686ae3a2f45307e8e8f102fd2b250aa37528a3ff40feedc6c2` is resolved.
+The differential regression submits `type(int256).min` directly to both hooked
+and unhooked pools at the original -60 tick price limit. It checks the original
+core fill (304238386100448167492 wei for 299535495591078093767 token units),
+identical pool state, and a bounty fee of exactly 1% of the actual ETH payment.
+Additional cases cover budgets around the quote cap, 1,000 randomized large
+budgets and price limits, and permanent retirement. A fresh token-only pool
+exercises deferred claims, rejected payout and permissionless retry at the same
+signed boundary. The settlement invariant also includes minimum-signed buys in
+its random batches. The constructor failure test now expects `InvalidAddress`,
+matching the revised implementation's handling of a failed destination read.

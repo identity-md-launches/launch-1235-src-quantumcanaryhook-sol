@@ -86,6 +86,8 @@ contract QuantumCanarySettlementInvariantTest is CanaryScenario {
         SwapParams[] memory swaps = new SwapParams[](2);
         swaps[0] = SwapParams(buy, mode & 2 == 0 ? -int256(amount) : int256(amount), buy ? lower : upper);
         swaps[1] = SwapParams(!buy, mode & 4 == 0 ? -int256(amount) : int256(amount), buy ? upper : lower);
+        // Exercise the repaired signed boundary amid payouts, failed reads and recipient changes.
+        if (mode & 8 != 0) swaps[buy ? 0 : 1].amountSpecified = type(int256).min;
         return _executeAndCheck(swaps, payInside ? 7 : 1, abi.encode(mode), true);
     }
 

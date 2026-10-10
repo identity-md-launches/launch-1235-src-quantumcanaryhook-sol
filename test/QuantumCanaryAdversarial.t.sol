@@ -5,6 +5,7 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
@@ -229,10 +230,35 @@ contract QuantumCanaryAdversarialTest is CanaryScenario {
         new QuantumCanaryHook(manager, selfDestination);
     }
 
-    function test_constructorBubblesMissingDestinationInsteadOfInventingOne() public {
+    function test_constructorRejectsAnUnavailableDestination() public {
         vm.mockCallRevert(address(canary), abi.encodeCall(IQuantumCanary.canaryAddress, ()), "unavailable destination");
-        vm.expectRevert(bytes("unavailable destination"));
+        vm.expectRevert(QuantumCanaryHook.InvalidAddress.selector);
         new QuantumCanaryHook(manager, canary);
+    }
+
+    function test_minimumSignedBuyOnFreshManagerAccruesRedeemableClaims() public {
+        assertEq(address(manager).balance, 0);
+        SwapParams[] memory swaps = new SwapParams[](1);
+        swaps[0] = SwapParams(true, type(int256).min, TickMath.getSqrtPriceAtTick(-120));
+        uint256 fee = _executeAndCheck(swaps, 1, "", true);
+        assertGt(fee, 0);
+        assertEq(bounty.balance, 0, "manager had no ETH during the callback");
+        assertEq(hook.accruedFees(), fee);
+        (uint160 price,,,) = manager.getSlot0(key.toId());
+        assertEq(price, swaps[0].sqrtPriceLimitX96);
+
+        receiver.configure(hook, 1);
+        assertEq(hook.payout(), 0, "failed payment preserves every claim");
+        assertEq(hook.accruedFees(), fee);
+        receiver.configure(hook, 0);
+        address caller = makeAddr("minimum-input payout caller");
+        vm.prank(caller);
+        assertEq(hook.payout(), fee);
+        assertEq(caller.balance, 0);
+        assertEq(bounty.balance, fee);
+        assertEq(hook.accruedFees(), 0);
+        assertEq(hook.payout(), 0, "no double payout");
+        _assertSettled();
     }
 
     function test_constructorRefusesAnAddressWithWrongPermissionBits() public {

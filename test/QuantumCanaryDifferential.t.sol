@@ -7,6 +7,7 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {QuantumCanaryTestBase} from "./QuantumCanaryHook.t.sol";
@@ -99,6 +100,94 @@ contract QuantumCanaryDifferentialTest is QuantumCanaryTestBase {
             bool buy = i % 2 == 0;
             _compareSwap(4000 ether, buy, i % 4 < 2, _limit(buy, 1500), true);
         }
+    }
+
+    /// @dev Regression for finding 74aefb96591090686ae3a2f45307e8e8f102fd2b250aa37528a3ff40feedc6c2.
+    /// Submit the signed amount directly: the ordinary test helper negates it before calling core.
+    function test_minimumSignedBuyMatchesTheOriginalUnhookedReproduction() public {
+        (BalanceDelta actual, uint256 fee) = _compareSaturatingBuy(type(int256).min, _limit(true, 60), true);
+        assertEq(int256(actual.amount0()) + int256(fee), -304238386100448167492, "original core ETH fill");
+        assertEq(actual.amount1(), 299535495591078093767, "original CANARY fill");
+    }
+
+    function test_largeBuyBudgetsAroundTheQuoteCapHaveIdenticalFills() public {
+        int256 cap = int256(uint256(uint128(type(int128).max)));
+        int256 threshold = cap * 100 / 99;
+        int256[8] memory budgets = [
+            -cap + 1, -cap, -cap - 1, -threshold + 1, -threshold, -threshold - 1, type(int256).min + 1, type(int256).min
+        ];
+        for (uint256 i; i < budgets.length; ++i) {
+            uint256 snapshot = vm.snapshotState();
+            _compareSaturatingBuy(budgets[i], _limit(true, 1500), true);
+            assertTrue(vm.revertToState(snapshot));
+        }
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_largeSignedBuyBudgetsPreserveCoreFills(uint256 seed, uint24 distance, uint16 protocolRate)
+        public
+    {
+        uint256 magnitude = bound(seed, 2 ** 127, 2 ** 255);
+        int256 budget = magnitude == 2 ** 255 ? type(int256).min : -int256(magnitude);
+        distance = uint24(bound(distance, 1, 1800));
+        _setProtocolFee(uint24(bound(protocolRate, 0, 1000)));
+        _compareSaturatingBuy(budget, _limit(true, distance), true);
+    }
+
+    function test_minimumSignedBuysRemainUntouchedAfterRetirement() public {
+        canary.setTripped(true);
+        _compareSaturatingBuy(type(int256).min, _limit(true, 60), false);
+        assertTrue(hook.retired());
+        canary.setTripped(false);
+        canary.setReadMode(1);
+        _compareSaturatingBuy(type(int256).min, _limit(true, 120), false);
+        assertTrue(hook.retired());
+    }
+
+    /// @dev Both pools receive the same oversized budget and reach the same price limit. Only
+    /// the finite core fill is settled, so neither the quote cap nor the fee may reduce token output.
+    function _compareSaturatingBuy(int256 budget, uint160 limit, bool feesEnabled)
+        internal
+        returns (BalanceDelta actual, uint256 fee)
+    {
+        uint256 obligationsBefore = hook.accruedFees() + bounty.balance;
+        uint256 protocolBefore = manager.protocolFeesAccrued(key.currency0);
+        bytes memory request = abi.encode(true, SwapParams(true, budget, limit));
+        {
+            uint256 userETH = address(this).balance;
+            uint256 userTokens = token.balanceOf(address(this));
+            vm.recordLogs();
+            actual = abi.decode(manager.unlock(request), (BalanceDelta));
+            fee = hook.accruedFees() + bounty.balance - obligationsBefore;
+            _assertEvents(vm.getRecordedLogs(), actual, fee);
+            uint256 spent = userETH - address(this).balance;
+            assertGt(spent, 0, "must exercise a real partial fill");
+            assertEq(spent, _abs(actual.amount0()), "settle the actual ETH payment only");
+            assertEq(token.balanceOf(address(this)) - userTokens, _abs(actual.amount1()));
+            assertEq(fee, feesEnabled ? spent / 100 : 0, "1% of actual payment, never the oversized budget");
+        }
+        uint256 protocolAfter = manager.protocolFeesAccrued(key.currency0);
+
+        PoolKey memory original = key;
+        key.hooks = IHooks(address(0));
+        BalanceDelta referenceDelta = abi.decode(manager.unlock(request), (BalanceDelta));
+        bytes32 referenceState = _stateDigest(key);
+        key = original;
+        assertEq(actual.amount0(), int256(referenceDelta.amount0()) - int256(fee));
+        assertEq(actual.amount1(), referenceDelta.amount1(), "same CANARY fill as unhooked core");
+        assertEq(_stateDigest(key), referenceState, "quote rollback preserves price, ticks and LP fees");
+        assertEq(
+            protocolAfter - protocolBefore,
+            manager.protocolFeesAccrued(key.currency0) - protocolAfter,
+            "quote must not double-charge protocol fees"
+        );
+        (uint160 price,,,) = manager.getSlot0(key.toId());
+        assertEq(price, limit, "partial fill reaches the price limit");
+        hook.payout();
+        assertEq(hook.accruedFees(), 0);
+        assertEq(bounty.balance, obligationsBefore + fee);
+        assertEq(address(hook).balance, 0);
+        assertEq(token.balanceOf(address(hook)), 0);
     }
 
     function _setProtocolFee(uint24 rate) internal {

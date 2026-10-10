@@ -2,7 +2,7 @@
 
 QuantumCanaryHook sends **100% of its flat 1% ETH swap fee to the Quantum Canary bounty**. No human can redirect or withdraw that fee. There is no owner, administrator, fee setter, pause, upgrade, or withdrawal function. Once the canary reports a trip, the hook permanently stops charging fees.
 
-The existing observer contract is on Ethereum mainnet at [`0x626517225096671868609c1bBF9c1B416A4eFd9a`](https://etherscan.io/address/0x626517225096671868609c1bBF9c1B416A4eFd9a). Its `canaryAddress()` supplies the destination, whose secp256k1 private key is unknown under the canary's cryptographic assumptions. Bounty ETH goes directly to that address, rather than to the observer contract. The hook reads the destination exactly once during construction and cannot change it.
+The existing observer contract is on Ethereum mainnet at [`0x626517225096671868609c1bBF9c1B416A4eFd9a`](https://etherscan.io/address/0x626517225096671868609c1bBF9c1B416A4eFd9a). Its `canaryAddress()` supplies the destination, `0x379C0A5704C211f26eadd26e670246E242Af9e7E`, whose secp256k1 private key is unknown under the canary's cryptographic assumptions. Bounty ETH goes directly to that address, rather than to the observer contract. The hook reads the destination exactly once during construction and cannot change it.
 
 **The requester keeps 0% of the token supply at launch.** QuantumCanaryToken is a plain ERC-20 named **Quantum Canary**, symbol **CANARY**, with 18 decimals and exactly **1,000,000,000 tokens**. It mints the entire fixed supply once to its deployer, the launch factory. The factory is responsible for sending 90% to the pool and 10% to the launch's Merkle distributor. Neither the requester nor this hook has a reserved allocation. Buying tokens later is an ordinary transfer; the token has no transfer tax or further minting path.
 
@@ -39,6 +39,8 @@ For these two modes the hook first performs a **reverting quote against the same
 
 The real swap respects the caller's original price limit. When it hits that limit, only the ETH actually traded is charged. Unused input remains with the router and follows its normal refund policy. The quote adds AMM computation cost to the two ETH-specified modes; it does not substitute another pool or price source. Once retired, the hook skips quotes and returns zero deltas.
 
+Saturating requests are accepted the way core accepts them: an exact-input budget of `type(int256).min` or an exact-output request near `type(int256).max` means "trade up to the price limit". The hook computes the magnitude without signed overflow and caps the quote request at core's `int128` fill limit, which a larger request could never exceed anyway. Core's own checked arithmetic still needs an exact-output request to leave room for the fee delta.
+
 ## Settlement and permissionless payout
 
 Every fee is initially minted as an ERC-6909 native ETH claim owned by the hook in the PoolManager, token id **0**. This works even when a fresh, token-only pool holds no ETH and its router settles the swap input after the callbacks.
@@ -53,11 +55,13 @@ Ordinary ETH transfers to the hook are rejected. Do not send it tokens or force 
 
 ## Retirement and monitoring
 
-`afterSwap` reads `isTripped()` using a bounded `staticcall`. Reverts, exhausted call gas, malformed return data, and invalid booleans are treated as not tripped and cannot block swaps. The hook also checks before a swap because ETH-specified fee deltas must be known there. The genuine PoolManager makes no mutable external call between these two callbacks, so the genuine observer's balance-based answer cannot change in that interval. Payout happens after the trip read.
+`afterSwap` reads `isTripped()` using a bounded `staticcall`. Reverts, exhausted call gas, malformed return data, and invalid booleans are treated as not tripped and cannot block swaps. The hook also checks before a swap because ETH-specified fee deltas must be known there. The genuine PoolManager makes no mutable external call between these two callbacks, so the genuine observer's balance-based answer cannot change in that interval.
+
+The observer's `isTripped()` is a live balance predicate, not a latch: a refill of the bounty clears it. Because the hook's own payout is such a refill, **every payout path reads the trip before it burns or transfers anything**: the automatic payout at the end of a swap, a standalone `payout()`, and a `payout()` made by a router inside its own unlock. A drained bounty is therefore latched as retired by whichever hook action comes first, and the hook's transfer can never hide it. Pending claims are still paid to the bounty after retirement.
 
 The first true observation sets `retired` permanently. A later refill of the bounty, a false response, or an unavailable observer cannot restore fees. Swaps still use the normal pool LP fee. Previously accrued claims remain payable to the bounty after retirement.
 
-**Monitoring responsibility:** the existing [observer implementation](https://github.com/identity-md-launches/launch-1213-src-quantumcanary-sol/blob/main/src/QuantumCanary.sol) requires its recorded high-water mark to reach `thresholdWei` before `isTripped()` can report a below-threshold balance. Anyone should call its existing permissionless `poke()` after funding reaches the threshold, and periodically thereafter. This hook reads the observer; it does not call `poke()`. Read `thresholdWei()` and `highWaterMark()` on chain rather than assuming it is armed. The observer's live alarm can clear on a refill before a swap observes it; monitoring bounty transactions and nonce remains useful. No keeper is privileged, and no keeper key controls fee funds.
+**Monitoring responsibility:** the existing [observer implementation](https://github.com/identity-md-launches/launch-1213-src-quantumcanary-sol/blob/main/src/QuantumCanary.sol) requires its recorded high-water mark to reach `thresholdWei` before `isTripped()` can report a below-threshold balance. Anyone should call its existing permissionless `poke()` after funding reaches the threshold, and periodically thereafter. This hook reads the observer; it does not call `poke()`. Read `thresholdWei()` and `highWaterMark()` on chain rather than assuming it is armed. A refill by a third party can still clear the live alarm before any hook action observes it; monitoring bounty transactions and nonce remains useful. No keeper is privileged, and no keeper key controls fee funds.
 
 ## Deployment parameters
 
@@ -66,7 +70,9 @@ The first true observation sets `retired` permanently. A later refill of the bou
 | QuantumCanaryToken | None; deploy from the launch factory |
 | QuantumCanaryHook | `IPoolManager manager`, `IQuantumCanary canary` |
 
-For this launch, `canary` is `0x626517225096671868609c1bBF9c1B416A4eFd9a` on Ethereum, chain id **1**. The launch supplies its actual PoolManager as a constructor argument; no manager address is hardcoded. Both dependencies and the derived destination are immutable. The canary must already exist and successfully return a nonzero destination at deployment. This constructor read is intentional and required by the task; local empty-chain rehearsals must deploy a mock canary first.
+For this launch, `canary` is `0x626517225096671868609c1bBF9c1B416A4eFd9a` on Ethereum, chain id **1**. The launch supplies its actual PoolManager as a constructor argument; no manager address is hardcoded. Both dependencies and the derived destination are immutable.
+
+The constructor reads `canaryAddress()` once with a guarded `staticcall`. When the observer has code, its answer must be a nonzero address or deployment reverts; on mainnet that answer is `0x379C0A5704C211f26eadd26e670246E242Af9e7E`. When the observer has **no code**, as on the empty chain where the launch's protected checks rehearse the attested creation code, the hook does not revert: for the launch observer only, it falls back to the constant `LAUNCH_CANARY_ADDRESS`, the same value. That constant is not a guess: the observer's source derives the address deterministically from its fixed seed phrase, and `test_launchDestinationMatchesTheObserverSourceDerivation` deploys a verbatim copy of that source offline and checks the derivation against the constant. Any other address without code is refused, so a mistyped observer cannot deploy silently.
 
 Enabled permissions are `beforeInitialize`, `beforeSwap`, `afterSwap`, `beforeSwapReturnDelta`, and `afterSwapReturnDelta`. All other permissions are false. Their low-address-bit mask is **`0x20cc`**. The constructor checks its own address bits against `getHookPermissions()`, and every implemented manager callback rejects other callers. Disabled callbacks and unknown selectors revert.
 
@@ -102,6 +108,6 @@ forge test --match-contract QuantumCanaryMainnetForkTest \
   --fork-url https://ethereum-rpc.publicnode.com --fork-block-number 26161866 -vv
 ```
 
-The mainnet destination read for that rehearsal was `0x379C0A5704C211f26eadd26e670246E242Af9e7E`; it is an observed value, not a hardcoded hook destination. The hook always derives its immutable destination from the constructor's observer.
+The mainnet destination read for that rehearsal was `0x379C0A5704C211f26eadd26e670246E242Af9e7E`, which equals the hook's offline fallback constant; both come from the same seed-phrase derivation in the observer's source. The fork test asserts that the live answer and the hook's immutable destination agree.
 
 See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the local adversarial review and its limits.

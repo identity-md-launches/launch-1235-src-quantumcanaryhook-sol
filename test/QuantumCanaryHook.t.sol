@@ -19,6 +19,7 @@ import {QuantumCanaryToken} from "../src/QuantumCanaryToken.sol";
 import {IQuantumCanary} from "../src/IQuantumCanary.sol";
 import {HookFlags} from "../src/HookFlags.sol";
 import {MockCanary, ToggleReceiver} from "./mocks/MockCanary.sol";
+import {QuantumCanary} from "./mocks/QuantumCanaryObserver.sol";
 
 /// @dev Uses the real vendored PoolManager and AMM math, not a manager mock.
 abstract contract QuantumCanaryTestBase is Test {
@@ -35,6 +36,7 @@ abstract contract QuantumCanaryTestBase is Test {
     address internal bounty;
     uint256 internal claimsBeforeRouterSettlement;
     bool internal payoutAfterSettlement;
+    bool internal drainBountyBeforeRouterPayout;
 
     function setUp() public virtual {
         vm.deal(address(this), 10_000_000 ether);
@@ -94,7 +96,11 @@ abstract contract QuantumCanaryTestBase is Test {
         }
         _settle(key.currency0, delta.amount0());
         _settle(key.currency1, delta.amount1());
-        if (swapping && payoutAfterSettlement) hook.payout();
+        if (swapping && payoutAfterSettlement) {
+            // Models a bounty drained after the swap's callbacks ran but before the router's payout.
+            if (drainBountyBeforeRouterPayout) vm.deal(bounty, 0);
+            hook.payout();
+        }
         assertEq(manager.currencyDelta(address(hook), key.currency0), 0, "unsettled ETH hook debt");
         assertEq(manager.currencyDelta(address(hook), key.currency1), 0, "unsettled token hook debt");
         return abi.encode(delta);
@@ -357,6 +363,127 @@ contract QuantumCanaryHookTest is QuantumCanaryTestBase {
         assertEq(address(receiver).balance, fee);
         assertEq(receiver.reentrantPaid(), 0);
         assertEq(hook.accruedFees(), 0);
+    }
+
+    /// @dev The protected floor CREATE2-deploys the attested creation code, with the launch's literal
+    /// observer baked in, on a chain where nothing lives at that address.
+    function test_attestedCreationCodeDeploysWithNoCodeAtTheLaunchObserver() public {
+        address observer = hook.LAUNCH_OBSERVER();
+        assertEq(observer.code.length, 0, "fixture: empty chain");
+        QuantumCanaryHook deployed = _mine(manager, IQuantumCanary(observer));
+        assertEq(address(deployed.quantumCanary()), observer);
+        assertEq(deployed.canaryAddress(), hook.LAUNCH_CANARY_ADDRESS());
+        assertFalse(deployed.retired());
+    }
+
+    /// @dev The fallback constant is not a guess: the observer's own source derives it from its seed phrase.
+    function test_launchDestinationMatchesTheObserverSourceDerivation() public {
+        QuantumCanary observer = new QuantumCanary(1 ether);
+        assertEq(observer.canaryAddress(), hook.LAUNCH_CANARY_ADDRESS());
+        QuantumCanaryHook deployed = _mine(manager, IQuantumCanary(address(observer)));
+        assertEq(deployed.canaryAddress(), hook.LAUNCH_CANARY_ADDRESS(), "read answer agrees with the constant");
+    }
+
+    function test_constructorRejectsUnknownEmptyOrBrokenObservers() public {
+        address unknownEmpty = makeAddr("observer with no code that is not the launch observer");
+        vm.expectRevert(QuantumCanaryHook.InvalidAddress.selector);
+        new QuantumCanaryHook(manager, IQuantumCanary(unknownEmpty));
+
+        MockCanary broken = new MockCanary(bounty);
+        vm.mockCallRevert(address(broken), abi.encodeCall(IQuantumCanary.canaryAddress, ()), "unavailable");
+        vm.expectRevert(QuantumCanaryHook.InvalidAddress.selector);
+        new QuantumCanaryHook(manager, IQuantumCanary(address(broken)));
+        vm.clearMockedCalls();
+
+        MockCanary silent = new MockCanary(bounty);
+        vm.mockCall(address(silent), abi.encodeCall(IQuantumCanary.canaryAddress, ()), "");
+        vm.expectRevert(QuantumCanaryHook.InvalidAddress.selector);
+        new QuantumCanaryHook(manager, IQuantumCanary(address(silent)));
+        vm.clearMockedCalls();
+
+        MockCanary zero = new MockCanary(address(0));
+        vm.expectRevert(QuantumCanaryHook.InvalidAddress.selector);
+        new QuantumCanaryHook(manager, IQuantumCanary(address(zero)));
+    }
+
+    /// @dev The live observer's alarm is a balance predicate, not a latch: paying the bounty can clear
+    /// it. A trip must be latched before the hook's own transfer, on the standalone payout path.
+    function test_payoutLatchesTheTripBeforeItsRefillClearsTheLiveAlarm() public {
+        QuantumCanary observer = _deployWithLiveObserver();
+        _swap(true, true, 100 ether, _wideLimit(true));
+        assertEq(hook.accruedFees(), 1 ether, "token-only manager: claims pending");
+
+        vm.deal(bounty, 0);
+        assertTrue(observer.isTripped());
+        assertEq(hook.payout(), 1 ether);
+        assertFalse(observer.isTripped(), "the refill cleared the live alarm");
+        assertTrue(hook.retired(), "but the trip was latched first");
+
+        (, uint256 fee) = _checkSwap(true, true, 1 ether, _wideLimit(true));
+        assertEq(fee, 0);
+        assertEq(bounty.balance, 1 ether);
+    }
+
+    /// @dev Same race on the in-unlock path: a router calling payout() after settling its input.
+    function test_payoutInsideRouterUnlockAlsoLatchesTheTripFirst() public {
+        QuantumCanary observer = _deployWithLiveObserver();
+        // Token-only manager: afterSwap cannot pay, so 1 ETH of claims is pending when the router,
+        // having settled its input, finds the bounty drained and calls payout() inside its unlock.
+        payoutAfterSettlement = true;
+        drainBountyBeforeRouterPayout = true;
+        _swap(true, true, 100 ether, _wideLimit(true));
+        assertTrue(hook.retired(), "latched by the in-unlock payout, after both swap callbacks saw no trip");
+        assertFalse(observer.isTripped(), "the refill cleared the live alarm");
+        assertEq(hook.accruedFees(), 0);
+        assertEq(bounty.balance, 1 ether);
+        drainBountyBeforeRouterPayout = false;
+        (, uint256 fee) = _checkSwap(true, true, 1 ether, _wideLimit(true));
+        assertEq(fee, 0);
+    }
+
+    function _deployWithLiveObserver() internal returns (QuantumCanary observer) {
+        observer = new QuantumCanary(1 ether);
+        bounty = observer.canaryAddress();
+        vm.deal(bounty, 1 ether);
+        observer.poke();
+        assertFalse(observer.isTripped());
+        manager = IPoolManager(address(new PoolManager(address(this))));
+        hook = _mine(manager, IQuantumCanary(address(observer)));
+        key = PoolKey(Currency.wrap(address(0)), Currency.wrap(address(token)), 12_500, 60, IHooks(address(hook)));
+        manager.initialize(key, Q96);
+        _liquidity(-600, -60, int256(LIQUIDITY));
+        assertEq(address(manager).balance, 0);
+    }
+
+    /// @dev Core accepts the most negative exact-input budget as "buy up to the price limit".
+    function test_minimumSignedExactInputBuyFillsToThePriceLimit() public {
+        uint160 limit = TickMath.getSqrtPriceAtTick(-60);
+        uint256 ethBefore = address(this).balance;
+        BalanceDelta d =
+            abi.decode(manager.unlock(abi.encode(true, SwapParams(true, type(int256).min, limit))), (BalanceDelta));
+        uint256 spent = ethBefore - address(this).balance;
+        assertEq(spent, uint256(-int256(d.amount0())));
+        assertGt(spent, 0);
+        (uint160 price,,,) = manager.getSlot0(key.toId());
+        assertEq(price, limit);
+        assertEq(bounty.balance + hook.accruedFees(), spent / 100, "1% of the ETH actually paid");
+    }
+
+    /// @dev Core accepts a saturating exact-output request as "sell up to the price limit". Core's own
+    /// checked addition of the hook delta needs the request to leave room for the fee itself.
+    function test_saturatingExactOutputSellFillsToThePriceLimit() public {
+        uint160 limit = TickMath.getSqrtPriceAtTick(60);
+        uint256 ethBefore = address(this).balance;
+        BalanceDelta d = abi.decode(
+            manager.unlock(abi.encode(true, SwapParams(false, type(int256).max - 1e30, limit))), (BalanceDelta)
+        );
+        uint256 received = address(this).balance - ethBefore;
+        assertEq(received, uint256(int256(d.amount0())));
+        assertGt(received, 0);
+        (uint160 price,,,) = manager.getSlot0(key.toId());
+        assertEq(price, limit);
+        uint256 fee = bounty.balance + hook.accruedFees();
+        assertEq(fee, (received + fee) / 100, "1% of the gross ETH actually received");
     }
 
     function test_immutableDestinationEvenIfMockChangesItsAnswer() public {

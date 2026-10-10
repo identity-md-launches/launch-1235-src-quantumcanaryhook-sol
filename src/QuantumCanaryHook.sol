@@ -32,9 +32,18 @@ contract QuantumCanaryHook is IUnlockCallback {
     int24 public constant TICK_SPACING = 60;
     uint160 public constant HOOK_FLAGS = (1 << 13) | (1 << 7) | (1 << 6) | (1 << 3) | (1 << 2);
 
+    /// @notice The launch's observer on Ethereum mainnet, and the destination it derives from its
+    ///         fixed seed phrase (verified live: canaryAddress() returned it on 2026-10-10).
+    /// @dev Used only when the observer has no code at construction, so the attested creation code
+    ///      deploys on an empty rehearsal chain. With code present, the read answer is always used.
+    address public constant LAUNCH_OBSERVER = 0x626517225096671868609c1bBF9c1B416A4eFd9a;
+    address public constant LAUNCH_CANARY_ADDRESS = 0x379C0A5704C211f26eadd26e670246E242Af9e7E;
+    // Largest amount v4 core can fill or settle for one currency: type(int128).max.
+    uint256 private constant MAX_CORE_AMOUNT = 2 ** 127 - 1;
+
     // External dependency gas is bounded so a broken canary or recipient cannot consume swap gas.
     uint256 private constant TRIP_READ_GAS = 30_000;
-    uint256 private constant AUTO_PAYOUT_GAS = 120_000;
+    uint256 private constant AUTO_PAYOUT_GAS = 150_000;
     // Transient storage is scoped to this contract; it has no inherited storage or delegatecalls.
     bytes32 private constant FEE_SLOT = bytes32(uint256(1));
     bytes32 private constant PAYING_SLOT = bytes32(uint256(2));
@@ -58,7 +67,17 @@ contract QuantumCanaryHook is IUnlockCallback {
         if (address(manager) == address(0) || address(canary) == address(0)) revert InvalidAddress();
         poolManager = manager;
         quantumCanary = canary;
-        address destination = canary.canaryAddress();
+        address destination;
+        if (address(canary).code.length == 0) {
+            // Offline rehearsal of the attested creation code: only the launch observer's answer is known.
+            if (address(canary) != LAUNCH_OBSERVER) revert InvalidAddress();
+            destination = LAUNCH_CANARY_ADDRESS;
+        } else {
+            (bool ok, bytes memory answer) =
+                address(canary).staticcall(abi.encodeCall(IQuantumCanary.canaryAddress, ()));
+            if (!ok || answer.length != 32 || uint256(bytes32(answer)) > type(uint160).max) revert InvalidAddress();
+            destination = address(uint160(uint256(bytes32(answer))));
+        }
         if (destination == address(0) || destination == address(this) || destination == address(manager)) {
             revert InvalidAddress();
         }
@@ -104,17 +123,23 @@ contract QuantumCanaryHook is IUnlockCallback {
         uint256 fee = 0;
         if (!retired && _ethIsSpecified(params)) {
             SwapParams memory quotedParams = params;
+            // Quotes are capped at core's int128 fill limit: a larger request fills identically or
+            // not at all, and the cap keeps signed arithmetic finite at the int256 boundaries.
             if (params.zeroForOne) {
                 // Exact-input ETH buy: reserve 1% of the user's maximum total payment.
-                uint256 budget = uint256(-params.amountSpecified);
+                uint256 budget;
+                unchecked {
+                    budget = uint256(-params.amountSpecified); // type(int256).min wraps to 2**255
+                }
                 uint256 reserved = budget / 100;
-                quotedParams.amountSpecified += int256(reserved);
+                quotedParams.amountSpecified = -int256(_min(budget - reserved, MAX_CORE_AMOUNT));
                 uint256 used = uint256(-int256(_quoteETH(key, quotedParams)));
                 fee = _min(reserved, used / 99);
             } else {
                 // Exact-output ETH sell: requested output is NET of the bounty fee.
-                uint256 reserved = uint256(params.amountSpecified) / 99;
-                quotedParams.amountSpecified += int256(reserved);
+                uint256 requested = uint256(params.amountSpecified);
+                uint256 reserved = requested / 99;
+                quotedParams.amountSpecified = int256(_min(requested + reserved, MAX_CORE_AMOUNT));
                 uint256 gross = uint256(int256(_quoteETH(key, quotedParams)));
                 fee = _min(reserved, gross / 100);
             }
@@ -184,8 +209,11 @@ contract QuantumCanaryHook is IUnlockCallback {
     }
 
     function _redeem() private {
+        // The observer's alarm is live, not latched: paying the bounty can clear it. Latch any trip
+        // before this hook's own transfer can hide it, on every payout path.
+        _observeTrip();
         uint256 amount = _min(accruedFees(), address(poolManager).balance);
-        amount = _min(amount, uint256(uint128(type(int128).max)));
+        amount = _min(amount, MAX_CORE_AMOUNT);
         if (amount == 0) return;
         poolManager.burn(address(this), 0, amount);
         // The ONLY outward asset transfer in this hook. No caller supplies its recipient.
